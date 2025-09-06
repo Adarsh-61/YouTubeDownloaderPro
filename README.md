@@ -14,6 +14,12 @@ A modern, GUI-based YouTube downloader rebuilt for stability, clarity, and advan
 - Thread-safe tkinter UI
 - Uses yt-dlp + FFmpeg under the hood
 
+## 📸 Demo
+
+![YouTube Downloader Pro Screenshot](YouTubeDownloaderPro.bmp)
+
+*Clean, modern interface with real-time progress tracking and quality selection*
+
 ## 🛠 Requirements
 - Python 3.10 or newer
 - yt-dlp (latest)
