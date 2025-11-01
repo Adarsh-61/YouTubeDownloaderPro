@@ -100,17 +100,24 @@ class QualityPresets:
     @staticmethod
     def get_maximum_quality():
         """8K/4320p > 4K/2160p > 1440p > 1080p > 720p > best available"""
+        # Prefer pure video+audio DASH streams at highest res; avoid progressive-only fallback unless absolutely necessary
         return {
             'format': (
-                'bestvideo[height>=4320][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height>=4320]+bestaudio/'
-                'bestvideo[height>=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height>=2160]+bestaudio/'
-                'bestvideo[height>=1440][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height>=1440]+bestaudio/'
-                'bestvideo[height>=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height>=1080]+bestaudio/'
-                'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best'
+                'bv*[height>=4320]+ba/bv*[height>=2160]+ba/'
+                'bv*[height>=1440]+ba/bv*[height>=1080]+ba/'
+                'bv*+ba/best'
             ),
-            'merge_output_format': 'mp4',
+            # Let yt-dlp merge to MKV (no re-encode) when necessary for maximum quality
+            'merge_output_format': 'mkv',
             'prefer_free_formats': False,
-            'format_sort': ['res:4320', 'res:2160', 'res:1440', 'res:1080', 'fps', 'vbr', 'abr'],
+            'format_sort': [
+                # Resolution and frame rate first, then modern codecs
+                'res:4320', 'res:2160', 'res:1440', 'res:1080', 'res',
+                'fps', 'hdr:12', 'codec:av01', 'codec:vp9', 'codec:hevc', 'codec:h264',
+                # Finally prioritize higher bitrates
+                'vbr', 'abr'
+            ],
+            'format_sort_force': ['res', 'fps'],
         }
     
     @staticmethod
@@ -268,7 +275,10 @@ class YouTubeDownloaderPro:
         
         self.metadata_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(adv_frame, text="Add Metadata", 
-                       variable=self.metadata_var).pack(side=tk.LEFT, padx=5)
+                   variable=self.metadata_var).pack(side=tk.LEFT, padx=5)
+
+        self.cookies_path_var = tk.StringVar(value="")
+        ttk.Button(adv_frame, text="Import Cookies", command=self.import_cookies).pack(side=tk.LEFT, padx=5)
         
         # Output folder
         output_frame = ttk.LabelFrame(main_frame, text="Output Location", padding="10")
@@ -429,64 +439,100 @@ class YouTubeDownloaderPro:
         if folder:
             self.output_entry.delete(0, tk.END)
             self.output_entry.insert(0, folder)
+    
+    def import_cookies(self):
+        """Import a cookies.txt file for authenticated requests"""
+        path = filedialog.askopenfilename(
+            title="Select cookies.txt",
+            filetypes=[("Cookies.txt", "*.txt"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+
+        if not os.path.isfile(path):
+            messagebox.showerror("Invalid File", "Selected cookies file does not exist.")
+            return
+
+        self.cookies_path_var.set(path)
+        self.logger.success(f"✓ Cookies loaded from {path}")
             
-    def build_ydl_opts(self, url, download_id):
+    def build_ydl_opts(self, download_id, cancel_event, player_client, quality_override=None):
         """Build yt-dlp options based on settings"""
         output_dir = self.output_entry.get()
         os.makedirs(output_dir, exist_ok=True)
-        
-        cancel_event = threading.Event()
-        self.download_manager.cancel_events[download_id] = cancel_event
-        
+
+        # Folder structure per playlist when available
+        outtmpl = '%(title)s.%(ext)s'
+        if self.mode_var.get() != "single":
+            outtmpl = '%(playlist_title|Unknown Playlist)s/%(playlist_index|000)s - %(title)s.%(ext)s'
+
         # Base options
         ydl_opts = {
-            'outtmpl': os.path.join(output_dir, '%(playlist_title)s/%(title)s.%(ext)s'),
-            'ignoreerrors': True,
+            'outtmpl': outtmpl,
+            'paths': {'home': output_dir},
+            'ignoreerrors': False,
             'no_warnings': False,
             'quiet': False,
             'no_color': True,
             'retries': 10,
+            'retry_sleep_functions': {
+                'http': lambda n: min(20.0, 1.5 ** n),
+            },
             'fragment_retries': 10,
-            'concurrent_fragment_downloads': 5,
-            'buffersize': 1024 * 64,  # 64KB buffer
-            'http_chunk_size': 10485760,  # 10MB chunks
-            'ratelimit': None,  # No rate limit for maximum speed
+            'concurrent_fragment_downloads': 3,
+            'buffersize': 1024 * 128,
+            'http_chunk_size': 10485760,
+            'ratelimit': None,
             'throttledratelimit': None,
             'logger': self.logger,
             'progress_hooks': [self.create_progress_hook(download_id, cancel_event)],
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': 'https://www.youtube.com/',
+                'Origin': 'https://www.youtube.com',
+            },
+            # Avoid forcing specific YouTube clients which can trigger PO-Token/SABR issues
         }
-        
+
+        cookies_path = self.cookies_path_var.get().strip()
+        if cookies_path:
+            if os.path.isfile(cookies_path):
+                ydl_opts['cookiefile'] = cookies_path
+            else:
+                self.logger.warning(f"Cookies file not found: {cookies_path}. Ignoring cookie configuration.")
+
         # Mode specific options
         if self.mode_var.get() == "single":
             ydl_opts['noplaylist'] = True
-            
+
         # Quality and format options
-        quality = self.quality_var.get()
+        selected_quality = quality_override or self.quality_var.get()
         format_choice = self.format_var.get()
-        
-        if quality == "audio" or format_choice == "mp3":
+
+        if selected_quality == "audio" or format_choice == "mp3":
             ydl_opts.update(QualityPresets.get_audio_maximum())
-        elif quality == "maximum":
+        elif selected_quality == "maximum":
             ydl_opts.update(QualityPresets.get_maximum_quality())
-        elif quality == "balanced":
+        elif selected_quality == "balanced":
             ydl_opts.update(QualityPresets.get_balanced_quality())
-            
+
         # Post-processors
-        postprocessors = []
-        
+        postprocessors = list(ydl_opts.get('postprocessors', []))
+
         if self.thumbnail_var.get() and format_choice == "mp4":
             postprocessors.append({
                 'key': 'EmbedThumbnail',
                 'already_have_thumbnail': False,
             })
             ydl_opts['writethumbnail'] = True
-            
+
         if self.metadata_var.get():
             postprocessors.append({
                 'key': 'FFmpegMetadata',
                 'add_chapters': True,
             })
-            
+
         if self.subtitle_var.get():
             ydl_opts['writesubtitles'] = True
             ydl_opts['writeautomaticsub'] = True
@@ -495,21 +541,30 @@ class YouTubeDownloaderPro:
                 'key': 'FFmpegEmbedSubtitle',
                 'already_have_subtitle': False,
             })
-            
-        # Ensure proper merging
-        if format_choice == "mp4" and quality != "audio":
-            postprocessors.append({
-                'key': 'FFmpegVideoRemuxer',
-                'preferedformat': 'mp4',
-            })
-            
+
+        if format_choice == "mp4" and selected_quality != "audio":
+            if selected_quality == "maximum":
+                # Let yt-dlp decide merge container via merge_output_format without any conversion
+                ydl_opts['merge_output_format'] = 'mkv'
+                self.logger.info("Preserving highest-quality video by muxing into MKV (no re-encode). Use the Balanced profile for MP4 remuxing.")
+            else:
+                # Balanced profile: remux to MP4 when possible (no re-encode)
+                postprocessors.append({
+                    'key': 'FFmpegVideoRemuxer',
+                    'preferedformat': 'mp4',
+                })
+
         if postprocessors:
             ydl_opts['postprocessors'] = postprocessors
-            
+        elif 'postprocessors' in ydl_opts and not ydl_opts['postprocessors']:
+            ydl_opts.pop('postprocessors', None)
+
         return ydl_opts
         
     def create_progress_hook(self, download_id, cancel_event):
         """Create progress hook for download tracking"""
+        last_speed_log = {'ts': 0.0}
+
         def hook(d):
             if cancel_event.is_set():
                 raise yt_dlp.utils.DownloadError("Download canceled by user")
@@ -525,15 +580,19 @@ class YouTubeDownloaderPro:
                     self.update_progress(percent, downloaded, total, speed, eta)
                     
                     # Log download speed and ETA
-                    if speed:
+                    if speed and (time.time() - last_speed_log['ts'] > 1.0):
+                        last_speed_log['ts'] = time.time()
                         speed_mb = speed / (1024 * 1024)
-                        eta_str = f"{eta // 60}:{eta % 60:02d}" if eta else "Unknown"
+                        eta_str = "Unknown"
+                        if eta and eta > 0:
+                            eta_int = max(0, int(eta))
+                            minutes, seconds = divmod(eta_int, 60)
+                            eta_str = f"{minutes}:{seconds:02d}"
                         self.logger.progress(f"Speed: {speed_mb:.2f} MB/s | ETA: {eta_str}")
                         
             elif d['status'] == 'finished':
                 filename = d.get('filename', 'Unknown')
-                self.logger.success(f"✓ Downloaded: {os.path.basename(filename)}")
-                self.update_progress(100)
+                self.logger.info(f"Segment finished: {os.path.basename(filename)}")
                 
             elif d['status'] == 'error':
                 self.logger.error(f"✗ Download error: {d.get('error', 'Unknown error')}")
@@ -549,9 +608,64 @@ class YouTubeDownloaderPro:
             if total > 0:
                 size_mb = total / (1024 * 1024)
                 downloaded_mb = downloaded / (1024 * 1024)
-                self.status_bar['text'] = f"Downloading: {downloaded_mb:.1f}/{size_mb:.1f} MB ({percent:.1f}%)"
+                status = f"Downloading: {downloaded_mb:.1f}/{size_mb:.1f} MB ({percent:.1f}%)"
+                if speed:
+                    speed_mb = speed / (1024 * 1024)
+                    status += f" | Speed: {speed_mb:.2f} MB/s"
+                if eta and eta > 0:
+                    eta_int = max(0, int(eta))
+                    minutes, seconds = divmod(eta_int, 60)
+                    status += f" | ETA: {minutes}:{seconds:02d}"
+                self.status_bar['text'] = status
                 
         self.root.after(0, update)
+
+    def reset_progress_bars(self):
+        """Reset progress indicators without toggling controls"""
+        def reset():
+            self.current_progress['value'] = 0
+            self.current_label['text'] = "0%"
+            self.status_bar['text'] = "Preparing download..."
+        self.root.after(0, reset)
+
+    def _build_player_client_list(self, primary_client):
+        """Generate an ordered list of player clients with fallback coverage"""
+        candidates = [
+            primary_client,
+            'android',
+            'android_embedded',
+            'ios',
+            'web',
+            'web_embedded',
+            'web_creator',
+            'mweb',
+            'tv_embedded',
+        ]
+
+        unique_clients = []
+        seen = set()
+        for client in candidates:
+            if client and client not in seen:
+                unique_clients.append(client)
+                seen.add(client)
+        return unique_clients
+
+    def _build_download_attempts(self, requested_quality):
+        """Compose a resilient attempt plan across yt-dlp clients/qualities"""
+        format_choice = self.format_var.get()
+        # Use a simplified, robust attempt plan without forcing specific clients
+        # 1) Try requested quality with default extractor behavior (best chance for high-res DASH)
+        # 2) If that fails and requested was maximum, try balanced
+        # 3) As a last resort, try audio-only when explicitly requested
+        attempts = []
+        if requested_quality == 'audio' or format_choice == 'mp3':
+            attempts.append({'client': None, 'quality': 'audio'})
+            return attempts
+
+        attempts.append({'client': None, 'quality': requested_quality})
+        if requested_quality == 'maximum' and format_choice != 'mp3':
+            attempts.append({'client': None, 'quality': 'balanced'})
+        return attempts
         
     def start_download(self):
         """Start the download process"""
@@ -580,38 +694,114 @@ class YouTubeDownloaderPro:
         self.logger.info(f"Format: {self.format_var.get()}")
         self.logger.info("=" * 50)
         
+        cancel_event = threading.Event()
+        self.download_manager.cancel_events[download_id] = cancel_event
+
         def download_thread():
+            requested_quality = self.quality_var.get()
+            attempts = self._build_download_attempts(requested_quality)
+            download_success = False
+            attempt_errors = []
+            start_time = None
+
             try:
-                ydl_opts = self.build_ydl_opts(url, download_id)
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    start_time = time.time()
-                    ydl.download([url])
-                    
-                    elapsed = time.time() - start_time
-                    self.logger.success(f"✓ Download completed in {elapsed:.1f} seconds!")
+                if not attempts:
+                    raise RuntimeError("No download strategies available for the current selection.")
+
+                for index, attempt in enumerate(attempts, start=1):
+                    if cancel_event.is_set():
+                        break
+
+                    client = attempt['client']
+                    quality = attempt['quality']
+                    self.logger.info(f"Attempt {index}/{len(attempts)} → client: {client}, quality: {quality}")
+                    self.reset_progress_bars()
+
+                    ydl_opts = self.build_ydl_opts(download_id, cancel_event, client, quality_override=quality)
+
+                    try:
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            start_time = time.time()
+                            exit_code = ydl.download([url])
+
+                        if exit_code == 0:
+                            elapsed = time.time() - start_time
+                            download_success = True
+                            self.update_progress(100)
+                            client_label = client or 'default'
+                            self.logger.success(f"✓ Download completed in {elapsed:.1f} seconds using {client_label} extractor")
+                            self.download_manager.download_history.append({
+                                'url': url,
+                                'timestamp': datetime.now().isoformat(),
+                                'duration': elapsed,
+                                'status': 'completed',
+                                'client': client,
+                                'quality': quality,
+                            })
+                            break
+
+                        error_msg = f"yt-dlp reported {exit_code} error(s) during attempt {index}"
+                        attempt_errors.append(error_msg)
+                        self.logger.error(error_msg)
+
+                    except yt_dlp.utils.DownloadError as e:
+                        if cancel_event.is_set():
+                            self.logger.warning("Download canceled by user")
+                            break
+
+                        message = str(e)
+                        attempt_errors.append(message)
+                        if "HTTP Error 403" in message:
+                            self.logger.warning(f"HTTP 403 encountered with {client} client. Trying next strategy...")
+                            continue
+
+                        self.logger.error(f"Download error using {client} client: {message}")
+                        break
+
+                    except Exception as e:
+                        attempt_errors.append(str(e))
+                        self.logger.error(f"Unexpected error during attempt {index}: {e}")
+                        logging.exception("Download failed")
+                        break
+
+                if cancel_event.is_set():
                     self.download_manager.download_history.append({
                         'url': url,
                         'timestamp': datetime.now().isoformat(),
-                        'duration': elapsed,
-                        'status': 'completed'
+                        'duration': (time.time() - start_time) if start_time else 0,
+                        'status': 'canceled',
                     })
-                    
-            except yt_dlp.utils.DownloadError as e:
-                if "canceled" in str(e).lower() or "cancelled" in str(e).lower():
-                    self.logger.warning("Download canceled by user")
-                else:
-                    self.logger.error(f"Download error: {str(e)}")
-            except Exception as e:
-                self.logger.error(f"Unexpected error: {str(e)}")
-                logging.exception("Download failed")
+                    return
+
+                if not download_success and not cancel_event.is_set():
+                    aggregated = "; ".join(attempt_errors) if attempt_errors else "Unknown error"
+                    self.logger.error(f"All download attempts failed. Details: {aggregated}")
+                    self.download_manager.download_history.append({
+                        'url': url,
+                        'timestamp': datetime.now().isoformat(),
+                        'duration': (time.time() - start_time) if start_time else 0,
+                        'status': 'failed',
+                        'errors': attempt_errors,
+                    })
+            except Exception as outer_error:
+                if not cancel_event.is_set():
+                    attempt_errors.append(str(outer_error))
+                    self.logger.error(f"Fatal error before completion: {outer_error}")
+                    logging.exception("Download failed")
+                    self.download_manager.download_history.append({
+                        'url': url,
+                        'timestamp': datetime.now().isoformat(),
+                        'duration': (time.time() - start_time) if start_time else 0,
+                        'status': 'failed',
+                        'errors': attempt_errors,
+                    })
             finally:
-                # Reset UI
                 self.root.after(0, self.reset_ui)
-                
-                # Clean up
+
                 if download_id in self.download_manager.cancel_events:
                     del self.download_manager.cancel_events[download_id]
+                if download_id in self.download_manager.active_downloads:
+                    del self.download_manager.active_downloads[download_id]
                     
         # Start download in background
         thread = threading.Thread(target=download_thread, daemon=True)
@@ -628,6 +818,7 @@ class YouTubeDownloaderPro:
             if self.download_manager.cancel_download(self.current_download_id):
                 self.logger.warning("Canceling download...")
                 self.cancel_btn.config(state=tk.DISABLED)
+                self.status_bar['text'] = "Canceling current download..."
 
     def reset_ui(self):
         """Reset UI after download"""
@@ -639,6 +830,7 @@ class YouTubeDownloaderPro:
         self.overall_progress['value'] = 0
         self.overall_label['text'] = "0%"
         self.status_bar['text'] = "Ready"
+        self.current_download_id = None
         
     def clear_log(self):
         """Clear the log text widget"""
