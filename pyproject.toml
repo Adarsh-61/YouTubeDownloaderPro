@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "youtube-downloader-pro"
+version = "3.0.0"
+description = "Modern YouTube download manager with GUI, multi-strategy retry, 8K→720p quality cascade"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords = ["youtube", "downloader", "yt-dlp", "gui", "video", "audio"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "yt-dlp>=2024.1.0",
+    "customtkinter>=5.2.0",
+]
+
+[project.scripts]
+ytdlp-gui = "ytdlp_gui.app:main"
+
+[tool.setuptools.packages.find]
+include = ["ytdlp_gui*"]
