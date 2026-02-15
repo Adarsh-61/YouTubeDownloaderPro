@@ -141,7 +141,7 @@ python --version   # verify: should print 3.10 or newer
 
 **Option A — Clone with Git:**
 ```bash
-git clone https://github.com/AdarshPandey-dev/YouTubeDownloaderPro.git
+git clone https://github.com/Adarsh-61/YouTubeDownloaderPro.git
 cd YouTubeDownloaderPro
 ```
 
